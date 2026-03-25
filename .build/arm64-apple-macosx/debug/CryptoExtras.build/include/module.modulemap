@@ -1,0 +1,3 @@
+module CryptoExtras {
+    header "/Users/jonathanholland/Dev/Buttery/ButteryUpdater/.build/arm64-apple-macosx/debug/CryptoExtras.build/include/CryptoExtras-Swift.h"
+}
