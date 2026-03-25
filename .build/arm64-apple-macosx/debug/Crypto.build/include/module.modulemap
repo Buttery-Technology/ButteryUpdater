@@ -1,0 +1,3 @@
+module Crypto {
+    header "/Users/jonathanholland/Dev/Buttery/ButteryUpdater/.build/arm64-apple-macosx/debug/Crypto.build/include/Crypto-Swift.h"
+}
