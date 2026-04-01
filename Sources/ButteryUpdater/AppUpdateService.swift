@@ -76,16 +76,30 @@ public actor AppUpdateService {
 		request.setValue(platform, forHTTPHeaderField: "X-App-Platform")
 		request.setValue(hostIdentifier, forHTTPHeaderField: "X-Host-ID")
 
+		logger.info("Checking for updates: \(url.absoluteString) (version: \(currentVersion), platform: \(self.platform))")
+
 		let (data, response) = try await URLSession.shared.data(for: request)
 
 		guard let httpResponse = response as? HTTPURLResponse,
 			  (200...299).contains(httpResponse.statusCode) else {
 			let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+			logger.error("Update check failed: server returned \(statusCode)")
 			throw AppUpdateError.checkFailed("Server returned status \(statusCode)")
 		}
 
 		let manifest = try JSONDecoder().decode(ManifestResponse.self, from: data)
 		let platformInfo = manifest.platforms[self.platform]
+
+		if manifest.updateAvailable {
+			logger.info("Update available: \(manifest.version ?? "unknown") (current: \(currentVersion))")
+			if let info = platformInfo {
+				logger.info("Download URL: \(info.url), size: \(info.size ?? 0) bytes")
+			} else {
+				logger.warning("No platform binary available for \(self.platform)")
+			}
+		} else {
+			logger.info("App is up to date (\(currentVersion))")
+		}
 
 		return UpdateCheckResult(
 			updateAvailable: manifest.updateAvailable,
@@ -116,6 +130,8 @@ public actor AppUpdateService {
 			throw AppUpdateError.invalidURL(urlString)
 		}
 
+		logger.info("Downloading update from: \(urlString)")
+
 		let tempDir = FileManager.default.temporaryDirectory
 			.appendingPathComponent("buttery-updates-\(appName)", isDirectory: true)
 		try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -137,24 +153,29 @@ public actor AppUpdateService {
 			try FileManager.default.removeItem(at: tempFile)
 		}
 		try FileManager.default.moveItem(at: downloadedURL, to: tempFile)
+		logger.info("Download complete: \(tempFile.path)")
 
 		// Verify file size
 		if let expectedSize {
 			let attributes = try FileManager.default.attributesOfItem(atPath: tempFile.path)
 			let actualSize = attributes[.size] as? Int ?? 0
 			guard actualSize == expectedSize else {
+				logger.error("Size mismatch: expected \(expectedSize), got \(actualSize)")
 				try? FileManager.default.removeItem(at: tempFile)
 				throw AppUpdateError.sizeMismatch(expected: expectedSize, actual: actualSize)
 			}
+			logger.info("Size verified: \(actualSize) bytes")
 		}
 
 		// Verify SHA-256 checksum
 		if let expectedChecksum {
+			logger.info("Verifying SHA-256 checksum...")
 			let data = try Data(contentsOf: tempFile)
 			let digest = SHA256.hash(data: data)
 			let actualChecksum = digest.compactMap { String(format: "%02x", $0) }.joined()
 
 			guard actualChecksum == expectedChecksum else {
+				logger.error("Checksum mismatch: expected \(expectedChecksum), got \(actualChecksum)")
 				try? FileManager.default.removeItem(at: tempFile)
 				throw AppUpdateError.checksumMismatch(expected: expectedChecksum, actual: actualChecksum)
 			}
@@ -171,6 +192,7 @@ public actor AppUpdateService {
 	/// Creates a backup of the current binary, moves the new one into place,
 	/// and sets executable permissions. Rolls back on failure.
 	public func installUpdate(from downloadedBinary: URL) throws {
+		logger.info("Installing update from \(downloadedBinary.path)...")
 		let currentExecutable = Bundle.main.executableURL!
 		let appBundle = Bundle.main.bundleURL
 		let executableName = currentExecutable.lastPathComponent
@@ -215,6 +237,7 @@ public actor AppUpdateService {
 	/// On macOS, launches a shell process that waits 1 second then opens the app bundle.
 	/// On Linux, simply exits (assumes a process supervisor will restart).
 	public nonisolated func relaunch() {
+		logger.info("Relaunching app...")
 		#if os(macOS)
 		let task = Process()
 		task.executableURL = URL(fileURLWithPath: "/bin/sh")
