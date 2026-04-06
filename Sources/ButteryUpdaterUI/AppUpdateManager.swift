@@ -26,11 +26,13 @@ import SwiftUI
 public final class AppUpdateManager: @unchecked Sendable {
 	public var state: AppUpdateState = .idle
 	public var showUpdateAlert: Bool = false
+	public var showUpdateWindow: Bool = false
 	public var showDownloadProgress: Bool = false
 	public var downloadProgress: Double = 0
 
 	private var updateResult: UpdateCheckResult?
 	private let service: AppUpdateService
+	private var checkTask: Task<Void, Never>?
 
 	public init(service: AppUpdateService) {
 		self.service = service
@@ -66,8 +68,23 @@ public final class AppUpdateManager: @unchecked Sendable {
 				state = .idle
 			}
 		} catch {
+			if Task.isCancelled { return }
 			state = .failed(error.localizedDescription)
 		}
+	}
+
+	/// Open the update window and begin checking for updates.
+	public func openAndCheck() {
+		showUpdateWindow = true
+		checkTask = Task { await checkForUpdates() }
+	}
+
+	/// Cancel an in-progress update check.
+	public func cancelCheck() {
+		checkTask?.cancel()
+		checkTask = nil
+		state = .idle
+		showUpdateWindow = false
 	}
 
 	// MARK: - Download + Verify + Install

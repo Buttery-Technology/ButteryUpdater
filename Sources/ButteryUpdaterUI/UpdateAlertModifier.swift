@@ -17,12 +17,16 @@ public struct UpdateAlertModifier: ViewModifier {
 
 	public func body(content: Content) -> some View {
 		content
+			.sheet(isPresented: $updateManager.showUpdateWindow) {
+				SoftwareUpdateView(manager: updateManager)
+			}
 			.alert(
 				"Update Available",
 				isPresented: $updateManager.showUpdateAlert
 			) {
-				Button("Update Now") {
-					Task { await updateManager.downloadAndInstall() }
+				Button("View Update") {
+					updateManager.showUpdateAlert = false
+					updateManager.showUpdateWindow = true
 				}
 				Button("Later", role: .cancel) {
 					updateManager.dismissUpdate()
@@ -35,19 +39,6 @@ public struct UpdateAlertModifier: ViewModifier {
 					if let changelog = updateManager.updateChangelog {
 						Text(changelog)
 					}
-				}
-			}
-			.overlay {
-				if updateManager.showDownloadProgress {
-					VStack(spacing: 12) {
-						ProgressView(value: updateManager.downloadProgress)
-							.frame(width: 200)
-						Text("Downloading update... \(Int(updateManager.downloadProgress * 100))%")
-							.font(.caption)
-							.foregroundStyle(.secondary)
-					}
-					.padding(24)
-					.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
 				}
 			}
 	}
