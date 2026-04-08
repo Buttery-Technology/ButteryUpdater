@@ -110,7 +110,8 @@ public actor AppUpdateService {
 			expectedChecksum: platformInfo?.sha256,
 			expectedSize: platformInfo?.size,
 			mandatory: false,
-			minVersion: manifest.minVersion
+			minVersion: manifest.minVersion,
+			dockerImage: manifest.dockerImage
 		)
 	}
 
@@ -314,6 +315,7 @@ struct ManifestResponse: Decodable {
 	let changelog: String?
 	let platforms: [String: PlatformInfo]
 	let updateAvailable: Bool
+	let dockerImage: String?
 
 	struct PlatformInfo: Decodable {
 		let url: String

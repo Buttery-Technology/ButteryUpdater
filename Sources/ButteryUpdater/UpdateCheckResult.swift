@@ -25,6 +25,8 @@ public struct UpdateCheckResult: Sendable {
 	public let mandatory: Bool
 	/// Minimum version that can upgrade directly to this release.
 	public let minVersion: String?
+	/// Docker image reference for container-based deployments.
+	public let dockerImage: String?
 
 	public init(
 		updateAvailable: Bool,
@@ -35,7 +37,8 @@ public struct UpdateCheckResult: Sendable {
 		expectedChecksum: String? = nil,
 		expectedSize: Int? = nil,
 		mandatory: Bool = false,
-		minVersion: String? = nil
+		minVersion: String? = nil,
+		dockerImage: String? = nil
 	) {
 		self.updateAvailable = updateAvailable
 		self.currentVersion = currentVersion
@@ -46,5 +49,6 @@ public struct UpdateCheckResult: Sendable {
 		self.expectedSize = expectedSize
 		self.mandatory = mandatory
 		self.minVersion = minVersion
+		self.dockerImage = dockerImage
 	}
 }

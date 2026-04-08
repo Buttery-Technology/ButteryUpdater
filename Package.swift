@@ -21,6 +21,12 @@ let package = Package(
             name: "ButteryUpdaterUI",
             targets: ["ButteryUpdaterUI"]
         ),
+        // Headless deployer — watches for new Docker releases and auto-deploys.
+        // Runs as a systemd sidecar on the server VM.
+        .executable(
+            name: "buttery-deployer",
+            targets: ["ButteryDeployer"]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"5.0.0"),
@@ -40,6 +46,16 @@ let package = Package(
         .target(
             name: "ButteryUpdaterUI",
             dependencies: ["ButteryUpdater"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+            ]
+        ),
+        .executableTarget(
+            name: "ButteryDeployer",
+            dependencies: [
+                "ButteryUpdater",
+                .product(name: "Logging", package: "swift-log"),
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
