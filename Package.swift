@@ -62,7 +62,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ButteryUpdaterTests",
-            dependencies: ["ButteryUpdater"],
+            dependencies: ["ButteryUpdater", "ButteryUpdaterUI"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

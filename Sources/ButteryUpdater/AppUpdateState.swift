@@ -12,7 +12,10 @@ public enum AppUpdateState: Sendable {
 	case updateAvailable(UpdateCheckResult)
 	case downloading(progress: Double)
 	case verifying
+	case staging
 	case readyToInstall(localPath: URL)
 	case installing
+	case relaunching
 	case failed(String)
+	case cancelled
 }
