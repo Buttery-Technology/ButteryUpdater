@@ -2,8 +2,9 @@
 //  AppUpdateService.swift
 //  ButteryUpdater
 //
-//  Core update service: check for updates, download binaries from GCS,
-//  verify SHA-256 checksums, perform atomic binary replacement, and relaunch.
+//  Core update service. Coordinates: check → download → verify → stage →
+//  install → relaunch. Bundle-based install with rollback marker. Streaming
+//  SHA-256 verification. Cancellable downloads via a dedicated URLSession.
 //
 
 import Crypto
@@ -18,19 +19,15 @@ import IOKit
 
 /// Actor-based service that handles the full app update lifecycle.
 ///
-/// Usage:
-/// ```swift
-/// let updater = AppUpdateService(
-///     serverBaseURL: "https://server.butteryai.com",
-///     appName: "dais"
-/// )
-/// let result = try await updater.checkForUpdates()
-/// if result.updateAvailable, let url = result.downloadURL {
-///     let path = try await updater.downloadUpdate(from: url, ...)
-///     try updater.installUpdate(from: path)
-///     updater.relaunch()
-/// }
-/// ```
+/// Higher-level callers (typically `AppUpdateManager`) drive each phase:
+/// 1. `checkForUpdates()` → `UpdateCheckResult`
+/// 2. `downloadFile(...)` → URL of zip on disk
+/// 3. `verifyChecksum(...)`
+/// 4. `stageBundle(...)` → URL of extracted `.app`
+/// 5. `installBundle(...)` (atomic swap, escalates if needed, writes marker)
+/// 6. `relaunch()`
+///
+/// On the next launch, `confirmRunningVersion()` clears the rollback backup.
 public actor AppUpdateService {
 	private let serverBaseURL: String
 	private let appName: String
@@ -38,12 +35,22 @@ public actor AppUpdateService {
 	private let platform: String
 	private let hostIdentifier: String
 	private let logger: Logger
+	private let installer: AppUpdateInstaller
+
+	/// Dedicated session — kept alive for the lifetime of the service so
+	/// progress delegates, redirects, and cancellation behave predictably.
+	private let downloadSession: URLSession
+	private let downloadDelegate: DownloadProgressDelegate
+
+	/// Currently-active download task, exposed for cancellation. Reset to nil
+	/// when the download completes (success or failure).
+	private var activeDownloadTask: URLSessionDownloadTask?
 
 	/// Create an update service for a specific app.
 	///
 	/// - Parameters:
-	///   - serverBaseURL: Base URL of the ButteryAI server (e.g. `https://server.butteryai.com`)
-	///   - appName: App identifier matching the server's release system (`butteryai`, `sous`, `server`, `dais`)
+	///   - serverBaseURL: Base URL of the ButteryAI server (e.g. `https://server.butteryai.com`).
+	///   - appName: App identifier matching the server's release system (`butteryai`, `sous`, `server`, `dais`).
 	///   - currentVersion: Override the current version. Defaults to `CFBundleShortVersionString`.
 	///   - platform: Override the platform identifier. Defaults to auto-detected value.
 	///   - hostIdentifier: Override the host ID for instance tracking. Defaults to hardware UUID (macOS) or machine-id (Linux).
@@ -57,9 +64,20 @@ public actor AppUpdateService {
 		self.serverBaseURL = serverBaseURL
 		self.appName = appName
 		self.currentVersion = currentVersion ?? (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0"
-		self.logger = Logger(label: "ButteryUpdater.\(appName)")
+		let logger = Logger(label: "ButteryUpdater.\(appName)")
+		self.logger = logger
 		self.platform = platform ?? Self.detectPlatform()
 		self.hostIdentifier = hostIdentifier ?? Self.generateHostIdentifier()
+		self.installer = AppUpdateInstaller(appName: appName, logger: logger)
+
+		let delegate = DownloadProgressDelegate()
+		self.downloadDelegate = delegate
+		let config = URLSessionConfiguration.default
+		config.allowsCellularAccess = true
+		config.waitsForConnectivity = true
+		config.timeoutIntervalForRequest = 60
+		config.timeoutIntervalForResource = 60 * 60 // 1h cap for huge bundles
+		self.downloadSession = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
 	}
 
 	// MARK: - Check for Updates
@@ -69,7 +87,9 @@ public actor AppUpdateService {
 	/// Sends the current version, platform, and host identifier to the server.
 	/// The server records the check-in for instance tracking.
 	public func checkForUpdates() async throws -> UpdateCheckResult {
-		let url = URL(string: "\(serverBaseURL)/api/releases/check/\(appName)")!
+		guard let url = URL(string: "\(serverBaseURL)/api/releases/check/\(appName)") else {
+			throw AppUpdateError.invalidURL("\(serverBaseURL)/api/releases/check/\(appName)")
+		}
 		var request = URLRequest(url: url)
 		request.httpMethod = "GET"
 		request.setValue(currentVersion, forHTTPHeaderField: "X-App-Version")
@@ -91,7 +111,7 @@ public actor AppUpdateService {
 		let platformInfo = manifest.platforms[self.platform]
 
 		if manifest.updateAvailable {
-			logger.info("Update available: \(manifest.version ?? "unknown") (current: \(currentVersion))")
+			logger.info("Update available: \(manifest.version) (current: \(currentVersion))")
 			if let info = platformInfo {
 				logger.info("Download URL: \(info.url), size: \(info.size ?? 0) bytes")
 			} else {
@@ -115,15 +135,15 @@ public actor AppUpdateService {
 		)
 	}
 
-	// MARK: - Download Update
+	// MARK: - Download
 
-	/// Download a binary from the given URL with progress reporting.
+	/// Download a file. Verifies file size if `expectedSize` is provided, but
+	/// does **not** verify the checksum — call `verifyChecksum(at:expected:)`
+	/// for that. Splitting these keeps the manager's UI state machine honest.
 	///
-	/// Verifies file size and SHA-256 checksum after download.
-	/// Returns the local file URL of the verified binary.
-	public func downloadUpdate(
+	/// Cancel the in-progress download via `cancelActiveDownload()`.
+	public func downloadFile(
 		from urlString: String,
-		expectedChecksum: String?,
 		expectedSize: Int?,
 		onProgress: @Sendable @escaping (Double) -> Void
 	) async throws -> URL {
@@ -133,117 +153,174 @@ public actor AppUpdateService {
 
 		logger.info("Downloading update from: \(urlString)")
 
-		let tempDir = FileManager.default.temporaryDirectory
-			.appendingPathComponent("buttery-updates-\(appName)", isDirectory: true)
-		try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+		let workingDir = try installer.ensureWorkingDirectory()
+		let downloadDir = workingDir.appendingPathComponent("download", isDirectory: true)
+		// Wipe any leftover zips from prior runs (success or failure). Each
+		// download writes a UUID-named file; without this, the dir grows
+		// without bound on repeated update cycles. Actor serialization
+		// guarantees no concurrent download is reading from this directory.
+		try? FileManager.default.removeItem(at: downloadDir)
+		try FileManager.default.createDirectory(at: downloadDir, withIntermediateDirectories: true)
+		let tempFile = downloadDir.appendingPathComponent("update-\(UUID().uuidString).zip")
 
-		let tempFile = tempDir.appendingPathComponent("\(appName)-update-\(UUID().uuidString)")
+		// Configure the delegate's progress callback for this download.
+		downloadDelegate.setProgressHandler(onProgress)
+		defer { downloadDelegate.setProgressHandler(nil) }
 
-		let (downloadedURL, response) = try await URLSession.shared.download(
-			for: URLRequest(url: url),
-			delegate: DownloadProgressDelegate(onProgress: onProgress)
-		)
-
-		guard let httpResponse = response as? HTTPURLResponse,
-			  (200...299).contains(httpResponse.statusCode) else {
-			let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-			throw AppUpdateError.downloadFailed("Server returned status \(statusCode)")
-		}
-
-		if FileManager.default.fileExists(atPath: tempFile.path) {
-			try FileManager.default.removeItem(at: tempFile)
-		}
-		try FileManager.default.moveItem(at: downloadedURL, to: tempFile)
-		logger.info("Download complete: \(tempFile.path)")
-
-		// Verify file size
-		if let expectedSize {
-			let attributes = try FileManager.default.attributesOfItem(atPath: tempFile.path)
-			let actualSize = attributes[.size] as? Int ?? 0
-			guard actualSize == expectedSize else {
-				logger.error("Size mismatch: expected \(expectedSize), got \(actualSize)")
-				try? FileManager.default.removeItem(at: tempFile)
-				throw AppUpdateError.sizeMismatch(expected: expectedSize, actual: actualSize)
-			}
-			logger.info("Size verified: \(actualSize) bytes")
-		}
-
-		// Verify SHA-256 checksum
-		if let expectedChecksum {
-			logger.info("Verifying SHA-256 checksum...")
-			let data = try Data(contentsOf: tempFile)
-			let digest = SHA256.hash(data: data)
-			let actualChecksum = digest.compactMap { String(format: "%02x", $0) }.joined()
-
-			guard actualChecksum == expectedChecksum else {
-				logger.error("Checksum mismatch: expected \(expectedChecksum), got \(actualChecksum)")
-				try? FileManager.default.removeItem(at: tempFile)
-				throw AppUpdateError.checksumMismatch(expected: expectedChecksum, actual: actualChecksum)
-			}
-			logger.info("Checksum verified: \(actualChecksum)")
-		}
-
-		return tempFile
-	}
-
-	// MARK: - Install Update
-
-	/// Atomically replace the running binary with the downloaded update.
-	///
-	/// Creates a backup of the current binary, moves the new one into place,
-	/// and sets executable permissions. Rolls back on failure.
-	public func installUpdate(from downloadedBinary: URL) throws {
-		logger.info("Installing update from \(downloadedBinary.path)...")
-		let currentExecutable = Bundle.main.executableURL!
-		let appBundle = Bundle.main.bundleURL
-		let executableName = currentExecutable.lastPathComponent
-
-		let targetPath: URL
-		if appBundle.pathExtension == "app" {
-			targetPath = appBundle.appendingPathComponent("Contents/MacOS/\(executableName)")
-		} else {
-			targetPath = currentExecutable
-		}
-
-		let parentDir = targetPath.deletingLastPathComponent()
-		let backupPath = parentDir.appendingPathComponent("\(executableName).backup")
-
-		if FileManager.default.fileExists(atPath: backupPath.path) {
-			try FileManager.default.removeItem(at: backupPath)
-		}
-
-		try FileManager.default.moveItem(at: targetPath, to: backupPath)
+		let task = downloadSession.downloadTask(with: URLRequest(url: url))
+		self.activeDownloadTask = task
+		defer { self.activeDownloadTask = nil }
 
 		do {
-			try FileManager.default.moveItem(at: downloadedBinary, to: targetPath)
-		} catch {
-			try? FileManager.default.moveItem(at: backupPath, to: targetPath)
-			throw AppUpdateError.installFailed("Failed to move new binary: \(error.localizedDescription)")
+			let (downloadedURL, response) = try await downloadDelegate.run(task: task)
+
+			guard let httpResponse = response as? HTTPURLResponse,
+				  (200...299).contains(httpResponse.statusCode) else {
+				let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+				throw AppUpdateError.downloadFailed("Server returned status \(statusCode)")
+			}
+
+			if FileManager.default.fileExists(atPath: tempFile.path) {
+				try FileManager.default.removeItem(at: tempFile)
+			}
+			try FileManager.default.moveItem(at: downloadedURL, to: tempFile)
+
+			if let expectedSize {
+				let attributes = try FileManager.default.attributesOfItem(atPath: tempFile.path)
+				let actualSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+				guard actualSize == expectedSize else {
+					try? FileManager.default.removeItem(at: tempFile)
+					throw AppUpdateError.sizeMismatch(expected: expectedSize, actual: actualSize)
+				}
+				logger.info("Size verified: \(actualSize) bytes")
+			}
+
+			logger.info("Download complete: \(tempFile.path)")
+			return tempFile
+		} catch is CancellationError {
+			task.cancel()
+			throw AppUpdateError.userCancelled
+		} catch let urlError as URLError where urlError.code == .cancelled {
+			throw AppUpdateError.userCancelled
 		}
+	}
 
-		try FileManager.default.setAttributes(
-			[.posixPermissions: 0o755],
-			ofItemAtPath: targetPath.path
-		)
+	/// Cancel the currently-running download, if any. The corresponding
+	/// `downloadFile(...)` call will throw `AppUpdateError.userCancelled`.
+	public func cancelActiveDownload() {
+		activeDownloadTask?.cancel()
+		activeDownloadTask = nil
+	}
 
-		try? FileManager.default.removeItem(at: backupPath)
+	// MARK: - Verify
 
-		logger.info("Update installed at \(targetPath.path)")
+	/// Verify a file's SHA-256 against `expected` using a streaming hasher
+	/// (1 MB chunks). Avoids loading multi-GB bundles into memory.
+	public func verifyChecksum(at fileURL: URL, expected: String) throws {
+		logger.info("Verifying SHA-256 checksum...")
+		let actual = try streamingSHA256Hex(of: fileURL)
+		guard actual == expected else {
+			logger.error("Checksum mismatch: expected \(expected), got \(actual)")
+			throw AppUpdateError.checksumMismatch(expected: expected, actual: actual)
+		}
+		logger.info("Checksum verified.")
+	}
+
+	/// Compute the streaming SHA-256 hex digest of a file. Public for tests.
+	///
+	/// Cancellation: each chunk iteration checks `Task.isCancelled` so that
+	/// cancelling the surrounding install Task aborts within ~1 MB of work
+	/// instead of hashing through the whole file.
+	public func streamingSHA256Hex(of fileURL: URL) throws -> String {
+		let handle = try FileHandle(forReadingFrom: fileURL)
+		defer { try? handle.close() }
+
+		var hasher = SHA256()
+		let chunkSize = 1 * 1024 * 1024 // 1 MB
+		while true {
+			if Task.isCancelled { throw CancellationError() }
+			let chunk: Data
+			do {
+				chunk = try handle.read(upToCount: chunkSize) ?? Data()
+			} catch {
+				throw AppUpdateError.installFailed("Read failed during checksum: \(error.localizedDescription)")
+			}
+			if chunk.isEmpty { break }
+			hasher.update(data: chunk)
+		}
+		return hasher.finalize().compactMap { String(format: "%02x", $0) }.joined()
+	}
+
+	// MARK: - Stage + Install (delegate to installer)
+
+	/// Translocation guard. Throws `.translocated` if the running bundle is
+	/// served from `/AppTranslocation/`.
+	public func ensureNotTranslocated() throws {
+		let bundle = Bundle.main.bundleURL.resolvingSymlinksInPath()
+		try installer.ensureNotTranslocated(currentBundle: bundle)
+	}
+
+	/// Extract the downloaded zip and validate the resulting `.app`.
+	///
+	/// Returns the URL of the staged `.app` bundle, ready to install.
+	public func stageBundle(zipPath: URL) throws -> URL {
+		let currentBundleName = Bundle.main.bundleURL.lastPathComponent
+		let staged = try installer.stageBundle(from: zipPath, expectedBundleName: currentBundleName)
+		try installer.stripQuarantine(at: staged)
+		try installer.verifySignature(at: staged, matchingBundle: Bundle.main.bundleURL)
+		return staged
+	}
+
+	/// Install the staged bundle by atomically swapping it into the running
+	/// bundle's location. Writes a rollback marker; escalates to admin
+	/// privileges if the parent directory is not user-writable.
+	public func installBundle(staged: URL, expectedVersion: String) throws {
+		let target = Bundle.main.bundleURL.resolvingSymlinksInPath()
+		try installer.installBundle(staged: staged, target: target, expectedVersion: expectedVersion)
+		// Stale download is no longer needed; staging dir is consumed by the swap.
+		installer.cleanupStaging()
+	}
+
+	// MARK: - Confirmation
+
+	/// Called on the next successful launch to clear the rollback backup
+	/// once we've verified we're running the new version.
+	public func confirmRunningVersion() {
+		installer.confirmRunningVersion(currentVersion)
 	}
 
 	// MARK: - Relaunch
 
-	/// Relaunch the app after an update.
-	///
-	/// On macOS, launches a shell process that waits 1 second then opens the app bundle.
-	/// On Linux, simply exits (assumes a process supervisor will restart).
-	public nonisolated func relaunch() {
+	/// Relaunch the app after an update. Errors are surfaced via
+	/// `AppUpdateError.relaunchFailed`. Does **not** call `terminate` if
+	/// the relaunch helper failed to start, so the user is left with a
+	/// running (old) app rather than a closed one.
+	public nonisolated func relaunch() throws {
 		logger.info("Relaunching app...")
 		#if os(macOS)
+		let bundleURL = Bundle.main.bundleURL.resolvingSymlinksInPath()
+
+		// `open -n` forces a fresh instance even if launchd thinks one is
+		// already running. The trailing fallback to plain `open` is for the
+		// rare case where -n is rejected by an entitlement-restricted bundle.
+		//
+		// Single-quote the path: /bin/sh interprets `\` inside double quotes,
+		// so a path like `/Volumes/My\Drive/App.app` would be munged. Single
+		// quotes are literal except for `'` itself, which we escape via the
+		// canonical `'\''` (close quote, literal `'`, reopen quote) pattern.
+		let quotedPath = "'" + bundleURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+		let command = "/bin/sleep 2 && /usr/bin/open -n \(quotedPath) || /usr/bin/open \(quotedPath)"
+
 		let task = Process()
 		task.executableURL = URL(fileURLWithPath: "/bin/sh")
-		task.arguments = ["-c", "sleep 1 && open \"\(Bundle.main.bundleURL.path)\""]
-		try? task.run()
+		task.arguments = ["-c", command]
+
+		do {
+			try task.run()
+		} catch {
+			logger.error("Relaunch helper failed to start: \(error.localizedDescription)")
+			throw AppUpdateError.relaunchFailed(error.localizedDescription)
+		}
 
 		#if canImport(AppKit)
 		DispatchQueue.main.async {
@@ -280,7 +357,7 @@ public actor AppUpdateService {
 	public static func generateHostIdentifier() -> String {
 		#if os(macOS) && canImport(IOKit)
 		let platformExpert = IOServiceGetMatchingService(
-			kIOMasterPortDefault,
+			kIOMainPortDefault,
 			IOServiceMatching("IOPlatformExpertDevice")
 		)
 		defer { IOObjectRelease(platformExpert) }
@@ -326,19 +403,85 @@ struct ManifestResponse: Decodable {
 
 // MARK: - Download Progress Delegate
 
+/// URLSession delegate that:
+/// - Forwards write progress to a settable handler.
+/// - Resolves a `(downloadedURL, response)` pair via continuation when the
+///   download finishes, so the actor can `await` the result.
 final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
-	let onProgress: @Sendable (Double) -> Void
+	private let lock = NSLock()
+	private var progressHandler: (@Sendable (Double) -> Void)?
+	private var continuation: CheckedContinuation<(URL, URLResponse?), Error>?
+	private var savedFileURL: URL?
 
-	init(onProgress: @Sendable @escaping (Double) -> Void) {
-		self.onProgress = onProgress
+	override init() { super.init() }
+
+	func setProgressHandler(_ handler: (@Sendable (Double) -> Void)?) {
+		lock.lock(); defer { lock.unlock() }
+		progressHandler = handler
 	}
+
+	/// Resume the task and await its completion.
+	func run(task: URLSessionDownloadTask) async throws -> (URL, URLResponse?) {
+		try await withTaskCancellationHandler {
+			try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(URL, URLResponse?), Error>) in
+				lock.lock()
+				continuation = cont
+				lock.unlock()
+				task.resume()
+			}
+		} onCancel: {
+			task.cancel()
+		}
+	}
+
+	// MARK: URLSessionDownloadDelegate
 
 	func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
 		guard totalBytesExpectedToWrite > 0 else { return }
-		onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+		let progress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+		lock.lock()
+		let handler = progressHandler
+		lock.unlock()
+		handler?(progress)
 	}
 
 	func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-		// Handled by the async download call
+		// Move file out of the URLSession-managed location into our own temp
+		// path before we return — the system deletes `location` as soon as
+		// this delegate method returns.
+		let tmp = FileManager.default.temporaryDirectory
+			.appendingPathComponent("buttery-updater-\(UUID().uuidString).bin")
+		do {
+			try FileManager.default.moveItem(at: location, to: tmp)
+			lock.lock()
+			savedFileURL = tmp
+			lock.unlock()
+		} catch {
+			lock.lock()
+			let cont = continuation
+			continuation = nil
+			lock.unlock()
+			cont?.resume(throwing: error)
+		}
+	}
+
+	func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+		lock.lock()
+		let cont = continuation
+		continuation = nil
+		let saved = savedFileURL
+		savedFileURL = nil
+		lock.unlock()
+
+		guard let cont else { return }
+		if let error {
+			cont.resume(throwing: error)
+			return
+		}
+		guard let saved else {
+			cont.resume(throwing: AppUpdateError.downloadFailed("No file produced by download"))
+			return
+		}
+		cont.resume(returning: (saved, task.response))
 	}
 }

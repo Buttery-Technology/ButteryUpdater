@@ -5,9 +5,10 @@
 //  SwiftUI view modifier that shows an update alert and download progress overlay.
 //
 
+import ButteryUpdater
 import SwiftUI
 
-/// View modifier that attaches an update alert and download progress overlay.
+/// View modifier that attaches an update alert and software-update window.
 public struct UpdateAlertModifier: ViewModifier {
 	@Bindable var updateManager: AppUpdateManager
 
@@ -22,8 +23,9 @@ public struct UpdateAlertModifier: ViewModifier {
 			}
 			.alert(
 				"Update Available",
-				isPresented: $updateManager.showUpdateAlert
-			) {
+				isPresented: $updateManager.showUpdateAlert,
+				presenting: updateManager.updateResult
+			) { _ in
 				Button("View Update") {
 					updateManager.showUpdateAlert = false
 					updateManager.showUpdateWindow = true
@@ -31,21 +33,24 @@ public struct UpdateAlertModifier: ViewModifier {
 				Button("Later", role: .cancel) {
 					updateManager.dismissUpdate()
 				}
-			} message: {
-				VStack {
-					if let version = updateManager.updateVersion {
-						Text("\(version) is available (you have \(updateManager.currentVersion)).")
-					}
-					if let changelog = updateManager.updateChangelog {
-						Text(changelog)
-					}
-				}
+			} message: { result in
+				Text(message(for: result))
 			}
+	}
+
+	private func message(for result: UpdateCheckResult) -> String {
+		var lines: [String] = [
+			"\(result.latestVersion) is available (you have \(updateManager.currentVersion))."
+		]
+		if let changelog = result.changelog, !changelog.isEmpty {
+			lines.append(changelog)
+		}
+		return lines.joined(separator: "\n\n")
 	}
 }
 
 extension View {
-	/// Attach an update alert and download progress overlay driven by the given manager.
+	/// Attach an update alert and software-update window driven by the given manager.
 	public func appUpdateAlert(manager: AppUpdateManager) -> some View {
 		modifier(UpdateAlertModifier(updateManager: manager))
 	}
