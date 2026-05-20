@@ -323,8 +323,18 @@ public actor AppUpdateService {
 		}
 
 		#if canImport(AppKit)
+		// `_Exit(0)` instead of `NSApplication.shared.terminate(...)` for
+		// the same reason `AppDelegate` does it on CMD+Q: Cocoa's graceful
+		// termination path can hang on the ggml-metal C++ static-destructor
+		// race. If terminate hangs past the 2s sleep above, the helper
+		// launches the new instance while the old one is still alive — the
+		// user sees two apps. `_Exit(0)` is immediate and bypasses the race.
+		//
+		// Safe to skip applicationWillTerminate hooks here: the user already
+		// confirmed the update; there's no work to save that wasn't flushed
+		// before the staged-bundle install ran.
 		DispatchQueue.main.async {
-			NSApplication.shared.terminate(NSApplication.shared)
+			_Exit(0)
 		}
 		#endif
 		#elseif os(Linux)
